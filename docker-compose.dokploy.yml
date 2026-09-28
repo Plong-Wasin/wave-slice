@@ -1,0 +1,4 @@
+services:
+  waveslice:
+    build: .
+    restart: unless-stopped
