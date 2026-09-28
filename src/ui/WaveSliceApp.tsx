@@ -242,10 +242,12 @@ export function WaveSliceApp() {
   const [selectionError, setSelectionError] = useState("");
   const [chunkMinutes, setChunkMinutes] = useState(59);
   const [overlapMinutes, setOverlapMinutes] = useState(1);
+  const [settingsError, setSettingsError] = useState("");
   const [results, setResults] = useState<Record<number, ChunkResult>>({});
   const [isProcessing, setIsProcessing] = useState(false);
   const [currentChunkIndex, setCurrentChunkIndex] = useState<number | null>(null);
   const [cancelPending, setCancelPending] = useState(false);
+  const [retryStart, setRetryStart] = useState(false);
   const [progressMessage, setProgressMessage] = useState("");
   const [isDragging, setIsDragging] = useState(false);
   const [isZipping, setIsZipping] = useState(false);
@@ -257,6 +259,15 @@ export function WaveSliceApp() {
   const runningRef = useRef(false);
   const cancelRef = useRef(false);
   const metadataRequestRef = useRef(0);
+  const metadataPendingRef = useRef(false);
+
+  useEffect(() => () => {
+    const engine = engineRef.current;
+    if (engine) {
+      engine.ffmpeg.terminate();
+      engineRef.current = null;
+    }
+  }, []);
 
   const plannedChunks = useMemo(() => {
     if (!duration || chunkMinutes < 1 || overlapMinutes < 0 || overlapMinutes >= chunkMinutes) return [];
@@ -292,7 +303,19 @@ export function WaveSliceApp() {
   }
 
   async function chooseSource(file?: File) {
-    if (!file || runningRef.current) return;
+    if (!file) return;
+    if (runningRef.current) {
+      setSelectionError("Cancel the active split before choosing another audio file.");
+      return;
+    }
+    if (isZipping) {
+      setSelectionError("Wait for ZIP creation to finish before changing the audio file.");
+      return;
+    }
+    if (metadataState === "reading" || metadataPendingRef.current) {
+      setSelectionError("Wait for the current file inspection to finish before choosing another audio file.");
+      return;
+    }
     if (!SUPPORTED_EXTENSIONS.has(fileExtension(file.name))) {
       setSelectionError("Choose an MP3, WAV, M4A, AAC, OGG, or WebM audio file.");
       return;
@@ -309,8 +332,12 @@ export function WaveSliceApp() {
     setDuration(null);
     setMetadataError("");
     setMetadataState("reading");
+    metadataPendingRef.current = true;
+    setSettingsError("");
     setResults({});
     setNotice("");
+    setZipError("");
+    setRetryStart(false);
     const request = ++metadataRequestRef.current;
 
     try {
@@ -318,11 +345,15 @@ export function WaveSliceApp() {
       if (request !== metadataRequestRef.current) return;
       setDuration(audioDuration);
       setMetadataState("ready");
+      metadataPendingRef.current = false;
+      setSelectionError("");
       setNotice("");
     } catch (error) {
       if (request !== metadataRequestRef.current) return;
       setMetadataState("error");
+      metadataPendingRef.current = false;
       setMetadataError(error instanceof Error ? error.message : "This file could not be read as audio. Try another file.");
+      setSelectionError("");
       setNotice("");
     }
   }
@@ -340,15 +371,29 @@ export function WaveSliceApp() {
   }
 
   function changeChunkMinutes(value: number) {
-    if (!Number.isInteger(value) || value < 1 || !resetResultsIfNeeded()) return;
+    if (!Number.isInteger(value) || value < 1) {
+      setSettingsError("Chunk length must be at least 1 whole minute.");
+      return;
+    }
+    if (!resetResultsIfNeeded()) return;
     setChunkMinutes(value);
+    setSettingsError("");
     setNotice("");
+    setZipError("");
+    setRetryStart(false);
   }
 
   function changeOverlapMinutes(value: number) {
-    if (!Number.isInteger(value) || value < 0 || value >= chunkMinutes || !resetResultsIfNeeded()) return;
+    if (!Number.isInteger(value) || value < 0 || value >= chunkMinutes) {
+      setSettingsError("Overlap must be a whole number from 0 up to (but not including) the chunk length.");
+      return;
+    }
+    if (!resetResultsIfNeeded()) return;
     setOverlapMinutes(value);
+    setSettingsError("");
     setNotice("");
+    setZipError("");
+    setRetryStart(false);
   }
 
   async function startSplit(startAt = 1) {
@@ -357,6 +402,7 @@ export function WaveSliceApp() {
     cancelRef.current = false;
     setCancelPending(false);
     setIsProcessing(true);
+    setRetryStart(false);
     setNotice("");
     setProgressMessage("Preparing your audio…");
     setZipError("");
@@ -437,6 +483,7 @@ export function WaveSliceApp() {
       }
     } catch (error) {
       if (!cancelRef.current) {
+        setRetryStart(true);
         setNotice(isMemoryFailure(error)
           ? MEMORY_ERROR
           : "The audio processor could not start. Reload the page or try again.");
@@ -562,7 +609,14 @@ export function WaveSliceApp() {
                 </div>
                 {metadataState === "error" && <p className="inline-error"><Icon name="alert" size={15} /> {metadataError}</p>}
               </div>
-              <button className="icon-button" disabled={isProcessing} aria-label="Remove audio file" title="Remove file" onClick={() => { if (!isProcessing) { clearEngineSource(); setSource(null); setDuration(null); setMetadataState("empty"); setResults({}); setMetadataError(""); setNotice(""); } }}>
+              <button className="icon-button" disabled={isProcessing || isZipping || metadataPendingRef.current} aria-label="Remove audio file" title="Remove file" onClick={() => {
+                if (isProcessing || isZipping || metadataPendingRef.current) return;
+                if (Object.values(results).some((result) => result.blob) && !window.confirm("Remove this audio file and all completed chunks?")) return;
+                clearEngineSource();
+                engineRef.current?.ffmpeg.terminate();
+                engineRef.current = null;
+                setSource(null); setDuration(null); setMetadataState("empty"); setResults({}); setMetadataError(""); setSelectionError(""); setSettingsError(""); setNotice(""); setZipError(""); setRetryStart(false);
+              }}>
                 <Icon name="close" size={19} />
               </button>
             </div>
@@ -591,7 +645,7 @@ export function WaveSliceApp() {
               <div className="setting-step"><span>STEP BETWEEN STARTS</span><strong>{Math.max(0, chunkMinutes - overlapMinutes)} min</strong></div>
               <div className="settings-summary"><span>{plannedChunks.length} {plannedChunks.length === 1 ? "chunk" : "chunks"}</span><i /> final chunk may be shorter</div>
             </div>
-            {invalidSettings && <p className="inline-error settings-error"><Icon name="alert" size={15} /> Overlap must be less than chunk length, and chunk length must be at least 1 minute.</p>}
+            {(invalidSettings || settingsError) && <p className="inline-error settings-error"><Icon name="alert" size={15} /> {settingsError || "Overlap must be less than chunk length, and chunk length must be at least 1 minute."}</p>}
           </section>
         )}
 
@@ -607,8 +661,8 @@ export function WaveSliceApp() {
                   <Icon name="zip" size={18} /> {isZipping ? `Building ZIP ${zipProgress}%` : "Download all ZIP"}
                 </button>}
                 {!allComplete && (
-                  <button className="button button--accent split-button" onClick={() => void startSplit()} disabled={isProcessing || isZipping || invalidSettings || metadataState !== "ready"}>
-                    {isProcessing ? <><i className="button-spinner" /> Processing…</> : completedCount ? "Resume split" : "Split audio"}
+                  <button className="button button--accent split-button" onClick={() => void startSplit()} disabled={isProcessing || isZipping || invalidSettings || Boolean(settingsError) || metadataState !== "ready"}>
+                    {isProcessing ? <><i className="button-spinner" /> Processing…</> : retryStart ? "Try again" : completedCount ? "Resume split" : "Split audio"}
                     {!isProcessing && <span className="button__arrow">↗</span>}
                   </button>
                 )}
@@ -620,7 +674,7 @@ export function WaveSliceApp() {
             {isProcessing && (
               <div className="processing-panel" role="status" aria-live="polite">
                 <div className="processing-panel__top"><span><i className="mini-spinner" /> {progressMessage || "Processing audio…"}</span><strong>Chunk {currentChunkIndex ?? "—"} / {plannedChunks.length}</strong></div>
-                <div className="progress-track"><div className="progress-track__fill" style={{ width: `${Math.max(4, Math.round(completedCount / Math.max(1, plannedChunks.length) * 100))}%` }} /></div>
+                <div className="progress-track progress-track--active"><div className="progress-track__fill" style={{ width: `${Math.max(4, Math.round(completedCount / Math.max(1, plannedChunks.length) * 100))}%` }} /></div>
                 <div className="processing-panel__bottom"><span>{completedCount} of {plannedChunks.length} chunks complete</span><button className="cancel-button" disabled={cancelPending} onClick={cancelSplit}>{cancelPending ? "Stopping…" : "Cancel"}</button></div>
               </div>
             )}

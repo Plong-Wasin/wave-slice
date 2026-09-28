@@ -15,9 +15,23 @@ export async function createAudioEngine(): Promise<AudioEngine> {
 }
 
 export async function loadAudioEngine(engine: AudioEngine): Promise<void> {
-  const coreURL = new URL("./ffmpeg/ffmpeg-core.js", document.baseURI).href;
-  const wasmURL = new URL("./ffmpeg/ffmpeg-core.wasm", document.baseURI).href;
-  await engine.ffmpeg.load({ coreURL, wasmURL });
+  const manifestURL = new URL("./ffmpeg/manifest.json", document.baseURI);
+  const response = await fetch(manifestURL, { cache: "no-cache" });
+  if (!response.ok) throw new Error("The audio processor assets could not be found.");
+  const manifest: unknown = await response.json();
+  if (
+    typeof manifest !== "object" || manifest === null ||
+    !("coreURL" in manifest) || typeof manifest.coreURL !== "string" ||
+    !("wasmURL" in manifest) || typeof manifest.wasmURL !== "string"
+  ) {
+    throw new Error("The audio processor manifest is invalid.");
+  }
+  const coreURL = new URL(manifest.coreURL, manifestURL);
+  const wasmURL = new URL(manifest.wasmURL, manifestURL);
+  if (coreURL.origin !== manifestURL.origin || wasmURL.origin !== manifestURL.origin) {
+    throw new Error("The audio processor must be loaded from this site.");
+  }
+  await engine.ffmpeg.load({ coreURL: coreURL.href, wasmURL: wasmURL.href });
   engine.ready = true;
 }
 

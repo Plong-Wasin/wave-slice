@@ -1,4 +1,6 @@
 import { expect, test } from "@playwright/test";
+import { readFile } from "node:fs/promises";
+import JSZip from "jszip";
 
 function silentWav(durationSeconds: number): Buffer {
   const sampleRate = 8_000;
@@ -29,9 +31,16 @@ function silentWav(durationSeconds: number): Buffer {
   return bytes;
 }
 
+function findMpegFrame(data: Uint8Array): number {
+  for (let index = 0; index < Math.min(data.length - 3, 16_384); index += 1) {
+    if (data[index] === 0xff && (data[index + 1] & 0xe0) === 0xe0) return index;
+  }
+  return -1;
+}
+
 test("a user splits local audio, previews and downloads chunks, and gets a ZIP without uploading the source", async ({ page }) => {
   const requests: { method: string; url: string }[] = [];
-  page.on("request", (request) => {
+  page.context().on("request", (request) => {
     requests.push({ method: request.method(), url: request.url() });
   });
 
@@ -50,6 +59,7 @@ test("a user splits local audio, previews and downloads chunks, and gets a ZIP w
       exact: true,
     }),
   ).toBeVisible();
+  expect(requests.some(({ url }) => new URL(url).pathname.endsWith("/ffmpeg/manifest.json"))).toBe(false);
 
   await page.getByLabel("Chunk length").fill("2");
   await page.getByRole("button", { name: "Split audio" }).click();
@@ -59,17 +69,47 @@ test("a user splits local audio, previews and downloads chunks, and gets a ZIP w
   await expect(page.getByText("00:01:00 → 00:02:30", { exact: true })).toBeVisible();
   await expect(page.getByLabel("Preview chunk 1")).toBeVisible();
 
-  const firstDownload = page.waitForEvent("download");
-  await page.getByRole("button", { name: "Download", exact: true }).first().click();
-  expect((await firstDownload).suggestedFilename()).toBe("meeting_001_000000-000200.mp3");
+  const chunkDownloads = page.getByRole("button", { name: "Download", exact: true });
+  await expect(chunkDownloads).toHaveCount(2);
+  for (const [index, fileName] of [
+    "meeting_001_000000-000200.mp3",
+    "meeting_002_000100-000230.mp3",
+  ].entries()) {
+    const download = page.waitForEvent("download");
+    await chunkDownloads.nth(index).click();
+    expect((await download).suggestedFilename()).toBe(fileName);
+  }
 
   const zipDownload = page.waitForEvent("download");
   await page.getByRole("button", { name: "Download all ZIP" }).click();
-  expect((await zipDownload).suggestedFilename()).toBe("meeting_chunks.zip");
+  const archiveDownload = await zipDownload;
+  expect(archiveDownload.suggestedFilename()).toBe("meeting_chunks.zip");
+  const archivePath = await archiveDownload.path();
+  expect(archivePath).not.toBeNull();
+  const archive = await JSZip.loadAsync(await readFile(archivePath!));
+  const expectedFiles = [
+    "meeting_001_000000-000200.mp3",
+    "meeting_002_000100-000230.mp3",
+  ];
+  expect(Object.keys(archive.files).filter((name) => !archive.files[name].dir)).toEqual(expectedFiles);
+
+  for (const fileName of expectedFiles) {
+    const entry = archive.file(fileName);
+    expect(entry).not.toBeNull();
+    const audio = await entry!.async("uint8array");
+    const frame = findMpegFrame(audio);
+    expect(frame).toBeGreaterThanOrEqual(0);
+    expect((audio[frame + 1] >> 3) & 0b11).toBe(0b10); // MPEG-2
+    expect((audio[frame + 1] >> 1) & 0b11).toBe(0b01); // Layer III
+    expect((audio[frame + 2] >> 4) & 0b1111).toBe(8); // 64 kbps
+    expect((audio[frame + 2] >> 2) & 0b11).toBe(2); // 16 kHz
+    expect(audio[frame + 3] >> 6).toBe(3); // Mono
+  }
 
   const appOrigin = new URL("http://127.0.0.1:4173").origin;
   expect(requests.filter(({ method }) => method !== "GET" && method !== "HEAD")).toEqual([]);
   expect(
     requests.filter(({ url }) => new URL(url).origin !== appOrigin),
   ).toEqual([]);
+  expect(requests.some(({ url }) => new URL(url).pathname.endsWith("/ffmpeg/manifest.json"))).toBe(true);
 });
