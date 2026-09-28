@@ -1,0 +1,13 @@
+.git
+.scratch
+node_modules
+dist
+public/ffmpeg
+coverage
+test-results
+playwright-report
+blob-report
+*.local.*
+.env
+.env.*
+!.env.example
